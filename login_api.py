@@ -228,7 +228,13 @@ def war_team(state):
     if not isinstance(current, list) or any(type(hid) is not int or hid not in roster for hid in current):
         raise RuntimeError('Invalid Great Ninja War attackers.')
     alive = [hid for hid, health in zip(roster, hp) if health > 0]
-    return ([hid for hid in current if hid in alive] + [hid for hid in alive if hid not in current])[:3]
+    if not alive:
+        return []
+    selected = ([hid for hid in current if hid in alive] + [hid for hid in alive if hid not in current])[:3]
+    # Keep three registered slots: the server can reject a one/two-ninja roster.
+    selected += [hid for hid in current if hid not in selected]
+    selected += [hid for hid in roster if hid not in selected]
+    return selected[:3]
 
 def run_gnw(socket, run=False):
     state = war_state(socket)
@@ -239,7 +245,6 @@ def run_gnw(socket, run=False):
         raise RuntimeError('Unknown Great Ninja War restart allowance.')
     if state['num'] == state['total'] == 1:
         send_command(socket, 'restartWar', 1)
-        wait_tower_state(socket, 'warInfo')
         state = war_state(socket)
         if state['num'] != 0 or state['currPass'] != 0 or any(hp != 1 for hp in war_hp(state, list(state['allAttackers']))):
             raise RuntimeError('Great Ninja War restart not confirmed; no retry.')
@@ -252,8 +257,8 @@ def run_gnw(socket, run=False):
             print('GNW quit: all registered ninja are dead. No revive.', flush=True)
             return state
         if state['currAttackers'] != hids:
+            print('GNW switching attackers: %s -> %s; requesting confirmation.' % (state['currAttackers'], hids), flush=True)
             send_command(socket, 'setWarAttackers', {'hids': hids})
-            wait_tower_state(socket, 'warInfo')
             state = war_state(socket)
             if state['currAttackers'] != hids:
                 raise RuntimeError('Great Ninja War team change not confirmed.')
@@ -264,13 +269,14 @@ def run_gnw(socket, run=False):
             raise RuntimeError('Unknown Great Ninja War stage/status.')
         # GNW requires the normal victory chest before the next battle, not tower cash-out.
         if before > 0 and state['status'] == 0:
+            print('GNW claiming stage %s chest; requesting confirmation.' % before, flush=True)
             send_command(socket, 'getWarReward', 1)
-            wait_tower_state(socket, 'warInfo')
             state = war_state(socket)
             if state['status'] != 1 or state['currPass'] != before:
                 raise RuntimeError('Great Ninja War chest not confirmed.')
         if attempt:
             time.sleep(1)
+        print('GNW sending battle at stage %s.' % before, flush=True)
         send_command(socket, 'doWarFight', {})
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -279,6 +285,7 @@ def run_gnw(socket, run=False):
                 break
         else:
             raise TimeoutError('Great Ninja War battle unconfirmed; do not retry blindly.')
+        print('GNW battle result received; requesting updated HP.', flush=True)
         state = war_state(socket)
         after_hp = war_hp(state, hids)
         print('GNW battle: %s; stage %s -> %s.' % ('victory' if result['win'] else 'defeat', before, state['currPass']), flush=True)
