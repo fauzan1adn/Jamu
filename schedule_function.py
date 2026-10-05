@@ -7,6 +7,7 @@ python schedule_function.py uninstall
 """
 import argparse
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -86,15 +87,14 @@ def task_xml(schedule, sid):
 
 
 @contextmanager
-def account_lock():
-    # ponytail: one account lock; per-account locks only if multiple .env files are supported.
+def account_lock(account=1):
     try:
         import msvcrt
         windows = True
     except ImportError:
         import fcntl
         windows = False
-    with (ROOT / 'schedule.lock').open('a+b') as lock:
+    with (ROOT / ('schedule-%s.lock' % account)).open('a+b') as lock:
         if not lock.tell():
             lock.write(b'0')
             lock.flush()
@@ -121,9 +121,38 @@ def account_lock():
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def notify_discord(label, status, detail=''):
+def configured_accounts(values):
+    numbers = {1} if values.get('NH_EMAIL') or values.get('NH_PASSWORD') else set()
+    for key in values:
+        match = re.fullmatch(r'NH_(?:EMAIL|PASSWORD|SERVER)_(\d+)', key)
+        if match:
+            number = int(match[1])
+            if number < 2 or str(number) != match[1]:
+                raise ValueError('Account suffix must be an integer >= 2.')
+            numbers.add(number)
+    if not numbers:
+        raise ValueError('No accounts configured.')
+    identities = set()
+    for number in sorted(numbers):
+        suffix = '' if number == 1 else '_' + str(number)
+        if not values.get('NH_EMAIL' + suffix) or not values.get('NH_PASSWORD' + suffix):
+            raise ValueError('Incomplete account %s.' % number)
+        server = int(values.get('NH_SERVER' + suffix) or '1')
+        if not 1 <= server <= 51:
+            raise ValueError('Invalid server for account %s.' % number)
+        # Authentication sessions may be account-wide, even across servers.
+        identity = values['NH_EMAIL' + suffix].strip().lower()
+        if not identity or identity in identities:
+            raise ValueError('Empty or duplicate login account %s.' % number)
+        identities.add(identity)
+    return sorted(numbers)
+
+def notify_discord(label, status, detail='', account=1):
+    label = 'Akun %s | %s' % (account, label)
     try:
-        url = (dotenv_values(ROOT / '.env').get('DISCORD_WEBHOOK_URL') or '').strip()
+        values = dotenv_values(ROOT / '.env')
+        key = 'DISCORD_WEBHOOK_URL' if account == 1 else 'DISCORD_WEBHOOK_URL_' + str(account)
+        url = (values.get(key) or '').strip()
         if not url:
             return
         target = urllib.parse.urlsplit(url)
@@ -148,10 +177,12 @@ def notify_discord(label, status, detail=''):
         print('Discord notification failed:', type(error).__name__, flush=True)
 
 
-def client(args):
+def client(args, account=1):
     env = os.environ.copy()
-    for key in ('NH_EMAIL', 'NH_PASSWORD', 'NH_SERVER'):
-        env.pop(key, None)  # Scheduled jobs always read the current project .env.
+    for key in list(env):
+        if re.fullmatch(r'NH_(?:EMAIL|PASSWORD|SERVER)(?:_\d+)?', key):
+            env.pop(key)  # Scheduled jobs always read the current project .env.
+    args = args + ['--account', str(account)]
     result = subprocess.run([sys.executable, '-u', str(ROOT / 'login_api.py'), '--allow-http'] + args,
                             cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, errors='replace', timeout=10800)
@@ -162,32 +193,32 @@ def client(args):
         stages = re.findall(r' -> (\d+)\.', result.stdout)
         detail = ('Total Stamina = ' if args[0] == '--ramen' else 'Stage terakhir: ') + stages[-1] if stages else ''
         status = 'Tidak tersedia / sudah diklaim' if 'stamina claim not available/already claimed' in result.stdout else 'Selesai'
-        notify_discord(args[0].lstrip('-').upper(), status, detail)
+        notify_discord(args[0].lstrip('-').upper(), status, detail, account)
     return result.stdout
 
 
-def run_job(job):
+def run_job(job, account=1):
     if job == 'towers':
-        with account_lock():
+        with account_lock(account):
             # Cron 01:00 WIB: normal battles; 3 total defeats per tower; end with Quit.
-            client(['--gst', '--gst-floors', '1000', '--tower-quit'])
-            client(['--snt', '--snt-floors', '1000', '--tower-quit'])
+            client(['--gst', '--gst-floors', '1000', '--tower-quit'], account)
+            client(['--snt', '--snt-floors', '1000', '--tower-quit'], account)
     elif job == 'gnw':
-        with account_lock():
-            # Cron 02:00 WIB: restart if available, fight until default team dead.
-            client(['--gnw', '--gnw-run'])
+        with account_lock(account):
+            # Restart if available, use all registered GNW ninja without revive.
+            client(['--gnw', '--gnw-run'], account)
     elif job == 'ramen':
-        with account_lock():
+        with account_lock(account):
             # Cron 12:00 and 18:00 WIB: server availability guards against repeat claims.
-            client(['--ramen'])
+            client(['--ramen'], account)
     elif job == 'beast':
         # Cron 20:00 daily + 15:00 weekends. Release lock/session during the cooldown,
         # so the ramen job can run without disconnecting an active battle session.
         attacks = 0
         initial_retries = 3
         while True:
-            with account_lock():
-                output = client(['--beast', '--beast-attack'])
+            with account_lock(account):
+                output = client(['--beast', '--beast-attack'], account)
             statuses = [line[13:]
                         for line in output.splitlines() if line.startswith('BEAST_STATUS ')]
             if len(statuses) != 1:
@@ -202,7 +233,7 @@ def run_job(job):
                     continue
                 print('Beast event no longer available; cron worker finished.', flush=True)
                 notify_discord('TAILED BEAST', 'Selesai' if attacks else 'Event tidak tersedia',
-                               'Attack terkonfirmasi: %s.' % attacks)
+                               'Attack terkonfirmasi: %s.' % attacks, account)
                 return
             cooldown = state.get('cooldown')
             if state.get('active') is not True or type(cooldown) is not int or not 0 <= cooldown <= 86400:
@@ -311,7 +342,21 @@ def main():
         with redirect_stdout(log), redirect_stderr(log):
             print('\n[%s] CRON %s starting.' % (datetime.now(WIB).isoformat(), args.job), flush=True)
             try:
-                run_job(args.job)
+                accounts = configured_accounts(dotenv_values(ROOT / '.env'))
+                def run_account(account):
+                    print('Account %s starting %s.' % (account, args.job), flush=True)
+                    try:
+                        run_job(args.job, account)
+                        return True
+                    except Exception as error:
+                        print('Account %s stopped: %s.' % (account, type(error).__name__), flush=True)
+                        notify_discord(args.job.upper(), 'Gagal / dihentikan', type(error).__name__, account)
+                        return False
+                with ThreadPoolExecutor(max_workers=len(accounts)) as workers:
+                    results = list(workers.map(run_account, accounts))
+                if not all(results):
+                    print('CRON stopped: one or more accounts failed.', flush=True)
+                    return 1
             except Exception as error:
                 # Do not expose URLs/credentials from network exceptions in unattended logs.
                 print('CRON stopped:', type(error).__name__, flush=True)

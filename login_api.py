@@ -218,7 +218,19 @@ def war_hp(state, hids):
     return hp
 
 
-def run_gnw(socket, hids, run=False):
+def war_team(state):
+    rates = state.get('allAttackers')
+    if not isinstance(rates, dict) or any(not str(hid).isdigit() or int(hid) <= 0 for hid in rates):
+        raise RuntimeError('Invalid Great Ninja War roster.')
+    roster = [int(hid) for hid in rates]
+    hp = war_hp(state, roster)
+    current = state.get('currAttackers')
+    if not isinstance(current, list) or any(type(hid) is not int or hid not in roster for hid in current):
+        raise RuntimeError('Invalid Great Ninja War attackers.')
+    alive = [hid for hid, health in zip(roster, hp) if health > 0]
+    return ([hid for hid in current if hid in alive] + [hid for hid in alive if hid not in current])[:3]
+
+def run_gnw(socket, run=False):
     state = war_state(socket)
     print('GNW entered: stage %s, restart %s/%s.' % (state['currPass'], state['num'], state['total']), flush=True)
     if not run:
@@ -229,25 +241,24 @@ def run_gnw(socket, hids, run=False):
         send_command(socket, 'restartWar', 1)
         wait_tower_state(socket, 'warInfo')
         state = war_state(socket)
-        if state['num'] != 0 or state['currPass'] != 0 or war_hp(state, hids) != [1, 1, 1]:
+        if state['num'] != 0 or state['currPass'] != 0 or any(hp != 1 for hp in war_hp(state, list(state['allAttackers']))):
             raise RuntimeError('Great Ninja War restart not confirmed; no retry.')
         print('GNW free restart confirmed.', flush=True)
     elif state['num'] != 0:
         raise RuntimeError('Restart is not 1/1 or 0 remaining; refusing unknown reset.')
-    if state['currAttackers'] != hids:
-        send_command(socket, 'setWarAttackers', {'hids': hids})
-        wait_tower_state(socket, 'warInfo')
-        state = war_state(socket)
-        if state['currAttackers'] != hids:
-            raise RuntimeError('Great Ninja War team change not confirmed.')
     for attempt in range(1000):
+        hids = war_team(state)
+        if not hids:
+            print('GNW quit: all registered ninja are dead. No revive.', flush=True)
+            return state
         if state['currAttackers'] != hids:
-            raise RuntimeError('Great Ninja War team changed; stopping.')
+            send_command(socket, 'setWarAttackers', {'hids': hids})
+            wait_tower_state(socket, 'warInfo')
+            state = war_state(socket)
+            if state['currAttackers'] != hids:
+                raise RuntimeError('Great Ninja War team change not confirmed.')
         hp = war_hp(state, hids)
         print('GNW stage %s; team HP: %s.' % (state['currPass'], ', '.join('%.1f%%' % (v * 100) for v in hp)), flush=True)
-        if not any(hp):
-            print('GNW quit: Himawari, Merz and Minato are all dead. No revive.', flush=True)
-            return state
         before = state['currPass']
         if type(before) is not int or before < 0 or state['status'] not in (0, 1):
             raise RuntimeError('Unknown Great Ninja War stage/status.')
@@ -272,8 +283,7 @@ def run_gnw(socket, hids, run=False):
         after_hp = war_hp(state, hids)
         print('GNW battle: %s; stage %s -> %s.' % ('victory' if result['win'] else 'defeat', before, state['currPass']), flush=True)
         if not any(after_hp):
-            print('GNW quit: Himawari, Merz and Minato are all dead. No revive.', flush=True)
-            return state
+            continue  # Replace dead attackers from the registered roster.
         if state['currPass'] == before and after_hp == hp:
             raise RuntimeError('Great Ninja War made no confirmed progress; stopping.')
     raise RuntimeError('Great Ninja War safety battle limit reached.')
@@ -355,8 +365,7 @@ def enter_village(account, signature, stay=0, gst=False, gst_floors=0, snt=False
         seen = set()
         team, heroes, player, buildings = {}, {}, {}, {}
         required = {'player', 'buildings', 'enterGame'}
-        if gnw:
-            required.update(('heros', 'hes'))
+
         logged_in = joined = started = False
         while time.monotonic() < deadline:
             raw = socket.recv()
@@ -389,8 +398,7 @@ def enter_village(account, signature, stay=0, gst=False, gst_floors=0, snt=False
         else:
             raise TimeoutError('Village initialization did not complete.')
         if gnw:
-            hids = ensure_team(socket, team, heroes)
-            run_gnw(socket, hids, gnw_run)
+            run_gnw(socket, gnw_run)
         elif gst or snt:
             run_tower(socket, snt_floors if snt else gst_floors, snt, tower_quit)
         if ramen:
@@ -417,6 +425,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--allow-http', action='store_true', help='Explicitly accept unencrypted credential transport used by this game.')
     parser.add_argument('--self-test', action='store_true')
+    parser.add_argument('--account', type=int, default=1, help='Account number in .env (1 uses unsuffixed keys).')
     parser.add_argument('--account-only', action='store_true', help='Skip the game-server handshake.')
     tower = parser.add_mutually_exclusive_group()
     tower.add_argument('--gst', action='store_true', help='Enter God Shinobi Tower (NH_SERVER).')
@@ -426,7 +435,7 @@ def main():
     tower.add_argument('--beast', action='store_true', help='Inspect Tailed Beast and cooldown; preserve current team.')
     parser.add_argument('--beast-attack', action='store_true', help='One normal Beast attack only if fresh cooldown is zero.')
     parser.add_argument('--tower-quit', action='store_true', help='End/cash-out GST or SNT after the run so next run requires Enter.')
-    parser.add_argument('--gnw-run', action='store_true', help='Restart GNW only at 1/1, fight until the default team is dead; no revive.')
+    parser.add_argument('--gnw-run', action='store_true', help='Restart GNW only at 1/1, fight using all registered GNW ninja; no revive.')
     parser.add_argument('--snt-floors', type=int, default=0, help='Advance up to this many SNT floors; quit after 3 total defeats, no purchases.')
     parser.add_argument('--gst-floors', type=int, default=0, help='Advance up to this many GST floors; quit after 3 total defeats, no purchases.')
     parser.add_argument('--stay', type=int, default=0, help='Keep village session open this many seconds after verification.')
@@ -534,16 +543,19 @@ def main():
         parser.error('--account-only cannot be combined with a tower.')
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).with_name('.env'), override=False)
+    if args.account < 1:
+        parser.error('--account must be positive.')
+    suffix = '' if args.account == 1 else '_' + str(args.account)
     try:
-        server = int(os.environ.get('NH_SERVER', '1'))
+        server = int(os.environ.get('NH_SERVER' + suffix, '1'))
     except ValueError:
         parser.error('NH_SERVER must be an integer.')
     if not 1 <= server <= 51:
         parser.error('NH_SERVER must be between 1 and 51 (known server list).')
     if not args.allow_http:
         parser.error('Endpoint uses plain HTTP. Use --allow-http only if you accept this risk.')
-    account = (os.environ.get('NH_EMAIL') or input('Account email: ')).strip()
-    password = os.environ.get('NH_PASSWORD') or getpass.getpass('Password (not saved): ')
+    account = (os.environ.get('NH_EMAIL' + suffix) or input('Account email: ')).strip()
+    password = os.environ.get('NH_PASSWORD' + suffix) or getpass.getpass('Password (not saved): ')
     if not account or not password:
         print('Account and password are required.')
         return 1
