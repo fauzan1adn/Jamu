@@ -160,7 +160,7 @@ def client(args):
         raise RuntimeError('API job failed; no automatic request retry.')
     if args[0] != '--beast':
         stages = re.findall(r' -> (\d+)\.', result.stdout)
-        detail = 'Stage terakhir: ' + stages[-1] if stages else ''
+        detail = ('Total Stamina = ' if args[0] == '--ramen' else 'Stage terakhir: ') + stages[-1] if stages else ''
         status = 'Tidak tersedia / sudah diklaim' if 'stamina claim not available/already claimed' in result.stdout else 'Selesai'
         notify_discord(args[0].lstrip('-').upper(), status, detail)
     return result.stdout
